@@ -298,28 +298,9 @@ fn price_field_to_f64(v: &serde_json::Value) -> Option<f64> {
 
 /// Strip ANSI escape sequences and control characters (preserving `\n`, `\r`, `\t`)
 /// from provider output, preventing terminal-injection from a compromised provider
-/// (cf. Ollama finding 007). Vendored from the in-tree Ollama plugin; a candidate
-/// to upstream into `wyrtloom-core` once a shared util module exists.
-pub fn strip_control(s: &str) -> String {
-    let mut out = String::with_capacity(s.len());
-    let mut chars = s.chars().peekable();
-    while let Some(c) = chars.next() {
-        if c == '\x1b' {
-            // Skip until the terminating ASCII letter of the escape sequence.
-            while let Some(&nc) = chars.peek() {
-                chars.next();
-                if nc.is_ascii_alphabetic() {
-                    break;
-                }
-            }
-        } else if c.is_control() && c != '\n' && c != '\r' && c != '\t' {
-            // Drop other control characters.
-        } else {
-            out.push(c);
-        }
-    }
-    out
-}
+/// (cf. Ollama finding 007). Re-exported from `wyrtloom-core` so every plugin
+/// applies the same audited logic rather than vendoring a copy.
+pub use wyrtloom_core::util::strip_control;
 
 #[cfg(test)]
 mod tests {
