@@ -1,0 +1,19 @@
+[package]
+name = "wyrtloom-provider-nous"
+version = "0.1.0"
+edition = "2021"
+license = "Apache-2.0"
+description = "Wyrtloom LlmProvider plugin for the Nous Portal (Nous Research) hosted inference API."
+repository = "https://github.com/codepilots/wyrtloom-provider-nous"
+
+[dependencies]
+# Local development depends on a sibling checkout of the Wyrtloom monorepo.
+wyrtloom-core = { path = "../wyrtloom/crates/core" }
+# Portable alternative (use instead of the path dep for out-of-tree builds — pin a rev):
+# wyrtloom-core = { git = "https://github.com/codepilots/wyrtloom.git", rev = "<sha>" }
+
+# rustls-tls (not the default native-tls) so this crate builds with no system OpenSSL / pkg-config.
+reqwest = { version = "0.12", default-features = false, features = ["json", "blocking", "rustls-tls"] }
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+thiserror = "1"
