@@ -31,6 +31,12 @@ pub const API_KEY_ENV: &str = "NOUS_API_KEY";
 /// Nous API hard limit on `max_tokens` (OpenAPI: 1–32000).
 const MAX_TOKENS_CEILING: u32 = 32_000;
 
+/// Maximum response body we will buffer before deserializing (8 MiB). A
+/// well-behaved chat/models response is a few KiB; this cap bounds memory use so a
+/// compromised or buggy provider cannot exhaust memory with an unbounded body
+/// (memory-DoS guard).
+const MAX_RESPONSE_BYTES: usize = 8 * 1024 * 1024;
+
 /// A Wyrtloom LLM provider backed by the Nous Portal inference API.
 pub struct NousProvider {
     base_url: String,
@@ -104,8 +110,8 @@ impl LlmProvider for NousProvider {
             return Err(err);
         }
 
-        let json: serde_json::Value = resp
-            .json()
+        let bytes = read_bounded_body(resp)?;
+        let json: serde_json::Value = serde_json::from_slice(&bytes)
             .map_err(|_| ProviderError::Transport("response decode failed".into()))?;
 
         parse_chat_response(&json, &req.model)
@@ -119,7 +125,10 @@ impl LlmProvider for NousProvider {
         if map_status(resp.status().as_u16()).is_some() {
             return vec![];
         }
-        let Ok(json) = resp.json::<serde_json::Value>() else {
+        let Ok(bytes) = read_bounded_body(resp) else {
+            return vec![];
+        };
+        let Ok(json) = serde_json::from_slice::<serde_json::Value>(&bytes) else {
             return vec![];
         };
         parse_models(&json)
@@ -130,16 +139,70 @@ impl LlmProvider for NousProvider {
 // Pure helpers (no I/O) — the entire wire contract, unit-testable offline.
 // ---------------------------------------------------------------------------
 
-/// Validate the base URL: HTTPS only, with localhost/127.0.0.1 permitted for test mock servers.
-fn validate_base_url(url: &str) -> Result<(), String> {
-    if url.starts_with("https://")
-        || url.starts_with("http://localhost")
-        || url.starts_with("http://127.0.0.1")
-    {
+/// Read a response body into memory, rejecting anything larger than
+/// [`MAX_RESPONSE_BYTES`] (memory-DoS guard).
+///
+/// A declared `Content-Length` over the cap is rejected up front without reading.
+/// Crucially, the body is then read through a `Read::take` limited to one byte past
+/// the cap, so even a chunked/length-less or Content-Length-spoofing oversize body
+/// is never fully buffered: at most `MAX_RESPONSE_BYTES + 1` bytes are ever
+/// allocated before we bail. Errors map to an opaque [`ProviderError::Transport`]
+/// (finding 021).
+fn read_bounded_body(mut resp: reqwest::blocking::Response) -> Result<Vec<u8>, ProviderError> {
+    use std::io::Read;
+
+    if let Some(len) = resp.content_length() {
+        if len > MAX_RESPONSE_BYTES as u64 {
+            return Err(ProviderError::Transport("response too large".into()));
+        }
+    }
+
+    // Read at most one byte beyond the cap. If we actually receive that many bytes,
+    // the body is over the limit and we reject without buffering the rest.
+    let mut buf = Vec::new();
+    let limit = MAX_RESPONSE_BYTES as u64 + 1;
+    resp.by_ref()
+        .take(limit)
+        .read_to_end(&mut buf)
+        .map_err(|_| ProviderError::Transport("network error".into()))?;
+    if buf.len() as u64 > MAX_RESPONSE_BYTES as u64 {
+        return Err(ProviderError::Transport("response too large".into()));
+    }
+    Ok(buf)
+}
+
+/// Validate the base URL: HTTPS only, with `http://localhost` / `http://127.0.0.1`
+/// permitted for test mock servers.
+///
+/// Uses real URL parsing (not string prefix matching) to defeat SSRF bypasses such
+/// as `http://localhost@evil.com` (userinfo), `http://localhost.evil.com` and
+/// `http://127.0.0.1.evil/` (subdomain/suffix tricks). Any URL carrying userinfo is
+/// rejected outright, and the http allowlist requires an *exact* host match.
+fn validate_base_url(raw: &str) -> Result<(), String> {
+    let parsed = url::Url::parse(raw)
+        .map_err(|e| format!("base_url '{raw}' is not a valid URL: {e}"))?;
+
+    // Reject any embedded credentials (e.g. http://localhost@evil.com): a non-empty
+    // username or password means the *authority* host is not what a prefix check sees.
+    if !parsed.username().is_empty() || parsed.password().is_some() {
+        return Err(format!(
+            "base_url '{raw}' is not permitted: userinfo (user:pass@) is not allowed"
+        ));
+    }
+
+    let host = parsed.host_str().unwrap_or("");
+    let permitted = match parsed.scheme() {
+        "https" => true,
+        // Exact host match only — no subdomains/suffixes.
+        "http" => host == "localhost" || host == "127.0.0.1",
+        _ => false,
+    };
+
+    if permitted {
         Ok(())
     } else {
         Err(format!(
-            "base_url '{url}' is not permitted: must be https://, or http://localhost / http://127.0.0.1 for tests"
+            "base_url '{raw}' is not permitted: must be https://, or http://localhost / http://127.0.0.1 for tests"
         ))
     }
 }
@@ -335,6 +398,32 @@ mod tests {
     }
 
     #[test]
+    fn ssrf_bypass_strings_are_rejected() {
+        // These all pass a naive `starts_with` allowlist but must be rejected by
+        // real URL parsing: userinfo, subdomain, and suffix tricks respectively.
+        assert!(
+            validate_base_url("http://localhost@evil.com").is_err(),
+            "userinfo bypass must be rejected"
+        );
+        assert!(
+            validate_base_url("http://localhost.evil.com").is_err(),
+            "subdomain bypass must be rejected"
+        );
+        assert!(
+            validate_base_url("http://127.0.0.1.evil/").is_err(),
+            "suffix bypass must be rejected"
+        );
+        // userinfo on an otherwise-https URL is also rejected.
+        assert!(validate_base_url("https://user:pass@example.com/v1").is_err());
+    }
+
+    #[test]
+    fn legitimate_base_urls_remain_accepted() {
+        assert!(validate_base_url("https://inference-api.nousresearch.com/v1").is_ok());
+        assert!(validate_base_url("http://localhost:8080/v1").is_ok());
+    }
+
+    #[test]
     fn empty_api_key_is_rejected() {
         assert!(NousProvider::new("   ", NOUS_BASE_URL).is_err());
         assert!(NousProvider::new("sk-real", NOUS_BASE_URL).is_ok());
@@ -381,6 +470,14 @@ mod tests {
                 assert!(m.starts_with("server returned HTTP") || m.contains("payment required"));
             }
         }
+    }
+
+    // 4b — response body cap (memory-DoS guard)
+    #[test]
+    fn response_body_cap_is_sane() {
+        // The cap is enforced in read_bounded_body; assert it is a meaningful,
+        // non-zero bound well above a normal response and at the documented 8 MiB.
+        assert_eq!(MAX_RESPONSE_BYTES, 8 * 1024 * 1024);
     }
 
     // 5 — request body construction
