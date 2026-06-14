@@ -178,15 +178,29 @@ fn read_bounded_body(mut resp: reqwest::blocking::Response) -> Result<Vec<u8>, P
 /// as `http://localhost@evil.com` (userinfo), `http://localhost.evil.com` and
 /// `http://127.0.0.1.evil/` (subdomain/suffix tricks). Any URL carrying userinfo is
 /// rejected outright, and the http allowlist requires an *exact* host match.
+/// Build a redacted, log-safe description of a parsed URL: scheme + host only,
+/// never the path, query, or userinfo. A `base_url` may carry `user:password@`,
+/// so the raw string must NEVER be interpolated into an error/log message —
+/// doing so would leak the password (finding: SSRF rejection echoes password).
+fn redact_url(parsed: &url::Url) -> String {
+    match parsed.host_str() {
+        Some(host) => format!("{}://{host}", parsed.scheme()),
+        None => format!("{}://<no-host>", parsed.scheme()),
+    }
+}
+
 fn validate_base_url(raw: &str) -> Result<(), String> {
+    // Do not echo `raw`: an unparseable string may still contain `user:password@`.
     let parsed = url::Url::parse(raw)
-        .map_err(|e| format!("base_url '{raw}' is not a valid URL: {e}"))?;
+        .map_err(|_| "base_url is not a valid URL".to_string())?;
 
     // Reject any embedded credentials (e.g. http://localhost@evil.com): a non-empty
     // username or password means the *authority* host is not what a prefix check sees.
     if !parsed.username().is_empty() || parsed.password().is_some() {
+        // Redact: the raw URL carries the credentials we are rejecting.
         return Err(format!(
-            "base_url '{raw}' is not permitted: userinfo (user:pass@) is not allowed"
+            "base_url '{}' is not permitted: userinfo (user:pass@) is not allowed",
+            redact_url(&parsed)
         ));
     }
 
@@ -202,7 +216,8 @@ fn validate_base_url(raw: &str) -> Result<(), String> {
         Ok(())
     } else {
         Err(format!(
-            "base_url '{raw}' is not permitted: must be https://, or http://localhost / http://127.0.0.1 for tests"
+            "base_url '{}' is not permitted: must be https://, or http://localhost / http://127.0.0.1 for tests",
+            redact_url(&parsed)
         ))
     }
 }
@@ -415,6 +430,24 @@ mod tests {
         );
         // userinfo on an otherwise-https URL is also rejected.
         assert!(validate_base_url("https://user:pass@example.com/v1").is_err());
+    }
+
+    #[test]
+    fn rejection_error_does_not_leak_password() {
+        // A base_url carrying userinfo must be rejected, and the resulting error
+        // message must NOT echo the password (finding: SSRF rejection leaked it).
+        let err = validate_base_url("https://user:secret@host/v1")
+            .expect_err("userinfo URL must be rejected");
+        assert!(
+            !err.contains("secret"),
+            "rejection error leaked the password: {err}"
+        );
+        // The actual userinfo segment (`user:secret@`) must not surface; the host
+        // alone is fine. (The fixed explanatory text "(user:pass@)" is not userinfo.)
+        assert!(
+            !err.contains("user:secret"),
+            "rejection error leaked userinfo: {err}"
+        );
     }
 
     #[test]
